@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import pandas as pd
 import pdfplumber
 from flask import Flask, request, render_template_string, send_file
@@ -22,8 +23,8 @@ HTML_TEMPLATE = """
 <body>
   <h2>Загрузка документов</h2>
   <form action="/" method="post" enctype="multipart/form-data">
-    УПД (PDF): <input type="file" name="upd"><br><br>
-    ТОРГ-12 (PDF): <input type="file" name="torg"><br><br>
+    УПД (PDF): <input type="file" name="upd" accept="application/pdf"><br><br>
+    ТОРГ-12 (PDF): <input type="file" name="torg" accept="application/pdf"><br><br>
     <input type="submit" value="Обработать">
   </form>
   {% if table %}
@@ -40,30 +41,36 @@ summary_df = None
 
 
 def safe_float(val):
-    """Безопасно преобразуем строку в число"""
-    if not isinstance(val, str):
+    """Безопасное преобразование строки в float"""
+    if val is None:
         return None
-    try:
-        return float(val.replace(" ", "").replace(",", "."))
-    except:
-        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        s = val.replace("\u00A0", " ").replace(" ", "").replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return None
+    return None
 
 
-def auto_code(name: str) -> str:
-    """Автоподстановка кода по названию"""
-    if not name:
-        return "—"
-    n = str(name).lower()
-    if "диван" in n:
-        return "9401410000"
-    if "стул" in n:
-        return "9401800009"
-    if "пуф" in n or "банкетка" in n:
-        return "9401800009"
-    return "—"
+def extract_10_digit_code(cell):
+    """Пробуем извлечь из ячейки 10-значный код (только цифры)"""
+    if not cell:
+        return None
+    digits = re.sub(r"\D", "", str(cell))
+    return digits if len(digits) == 10 else None
 
 
 def parse_upd(file):
+    """
+    Разбор УПД:
+    - Код вида товара: колонка 4 (если нет 10-значного → "—")
+    - Наименование:    колонка 3
+    - Кол-во:          колонка 7
+    - Стоимость:       колонка 9
+    """
     rows = []
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
@@ -73,18 +80,24 @@ def parse_upd(file):
             for row in table:
                 if not row or len(row) < 10:
                     continue
-                code = str(row[4]).replace("\n", "").strip() if row[4] else ""
-                name = str(row[3]).strip()
-                if not code or code == "—":
-                    code = auto_code(name)
+
+                code = extract_10_digit_code(row[4]) or "—"
+                name = str(row[3]).strip() if row[3] else ""
                 qty = safe_float(row[7])
                 cost = safe_float(row[9])
-                if name and qty and cost:
+
+                if name and qty is not None and cost is not None:
                     rows.append([code, name, qty, cost])
+
     return pd.DataFrame(rows, columns=["Код вида товара", "Наименование", "Кол-во", "Стоимость (₽)"])
 
 
 def parse_torg(file):
+    """
+    Разбор ТОРГ-12:
+    - Наименование: колонка 1
+    - Масса нетто:  колонка 9
+    """
     rows = []
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
@@ -94,9 +107,9 @@ def parse_torg(file):
             for row in table:
                 if not row or len(row) < 10:
                     continue
-                name = str(row[1]).strip()
+                name = str(row[1]).strip() if row[1] else ""
                 weight = safe_float(row[9])
-                if name and weight:
+                if name and weight is not None:
                     rows.append([name, weight])
     return pd.DataFrame(rows, columns=["Наименование", "Масса нетто (кг)"])
 

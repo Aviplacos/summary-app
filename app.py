@@ -51,4 +51,33 @@ def build_table(torg_text: str, upd_text: str):
     sum_mass = df["Масса"].sum()
     sum_qty = df["Количество"].sum()
     sum_cost = df["Стоимость"].sum()
-    df.loc[len(df)]
+    df.loc[len(df)] = ["ИТОГО", "", "", "", round(sum_mass, 2), int(sum_qty), round(sum_cost, 2)]
+    return df
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        torg12_file = request.files["torg12"]
+        upd_file = request.files["upd"]
+        torg_text = torg12_file.read().decode("utf-8")
+        upd_text = upd_file.read().decode("utf-8")
+
+        df = build_table(torg_text, upd_text)
+
+        # сохраняем в Excel
+        out_xlsx = "output.xlsx"
+        df.to_excel(out_xlsx, index=False)
+
+        return send_file(out_xlsx, as_attachment=True)
+
+    return render_template_string("""
+    <h2>Загрузка ТОРГ-12 и УПД</h2>
+    <form method="post" enctype="multipart/form-data">
+      <p>ТОРГ-12 (txt): <input type="file" name="torg12" required></p>
+      <p>УПД (txt): <input type="file" name="upd" required></p>
+      <p><input type="submit" value="Обработать"></p>
+    </form>
+    """)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

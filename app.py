@@ -1,73 +1,61 @@
-import os
-from flask import Flask, request, render_template_string, redirect, url_for
 import pandas as pd
-
-app = Flask(__name__)
-UPLOAD_FOLDER = "/tmp"   # для Render лучше /tmp (пишущий каталог)
-ALLOWED_EXTENSIONS = {"xlsx", "xls"}
-
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-
-TEMPLATE = """
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <title>Загрузка и просмотр таблицы</title>
-  <style>
-    body { font-family: sans-serif; margin: 2em; }
-    table { border-collapse: collapse; width: 100%; margin-top: 1em; }
-    th, td { border: 1px solid #ddd; padding: 6px; }
-    th { background: #f0f0f0; }
-    .total-row td { font-weight: bold; background: #fff8e1; }
-  </style>
-</head>
-<body>
-  <h1>Загрузка Excel-файла</h1>
-  <form method="post" enctype="multipart/form-data">
-    <input type="file" name="file" accept=".xlsx,.xls" required>
-    <button type="submit">Загрузить</button>
-  </form>
-  {% if table_html %}
-    <h2>Содержимое файла: {{ filename }}</h2>
-    {{ table_html|safe }}
-  {% endif %}
-</body>
-</html>
-"""
-
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    table_html = None
-    filename = None
-
-    if request.method == "POST":
-        if "file" not in request.files:
-            return redirect(request.url)
-        file = request.files["file"]
-        if file and allowed_file(file.filename):
-            filename = file.filename
-            filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-            file.save(filepath)
-
-            # читаем Excel
-            df = pd.read_excel(filepath)
-            # подсветка "Итого"
-            if "№" in df.columns:
-                df_html = df.to_html(index=False, classes="dataframe")
-                df_html = df_html.replace("<td>Итого</td>", "<td><b>Итого</b></td>")
-                table_html = df_html
-            else:
-                table_html = df.to_html(index=False, classes="dataframe")
-
-    return render_template_string(TEMPLATE, table_html=table_html, filename=filename)
-
-@app.route("/health")
-def health():
-    return "OK", 200
-
+import sys
+import os
+ 
+def clean_name(x: str) -> str:
+    if not isinstance(x, str):
+        return ""
+    return " ".join(x.replace("\n", " ").replace("  ", " ").strip().split())
+ 
+def build_final(proforma_path, waybill_path, output_path="Итоговая таблица.xlsx"):
+    # Чтение файлов
+    dfp = pd.read_excel(proforma_path, sheet_name="Лист_1")
+    dfw = pd.read_excel(waybill_path, sheet_name="Лист_1")
+ 
+    # --- Парсинг счета-проформы ---
+    pf_items = dfp[["Unnamed: 3", "Unnamed: 22", "Unnamed: 26", "Unnamed: 10"]].copy()
+    pf_items.columns = ["name", "qty", "unit_price", "code"]
+    pf_items["name_clean"] = pf_items["name"].apply(clean_name)
+    pf_items = pf_items[(pf_items["name_clean"] != "") & (pd.to_numeric(pf_items["qty"], errors="coerce").notna())]
+    pf_items["qty"] = pd.to_numeric(pf_items["qty"], errors="coerce").astype("Int64")
+    pf_items["unit_price"] = pd.to_numeric(pf_items["unit_price"], errors="coerce")
+    pf_items["code"] = pf_items["code"].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
+    pf_items["cost"] = (pf_items["qty"].astype(float) * pf_items["unit_price"]).round(0).astype("Int64")
+    pf_items = pf_items[pf_items["name_clean"].str.len() > 5].reset_index(drop=True)
+ 
+    # --- Парсинг накладной ---
+    wb_items = dfw[["Unnamed: 1", "Unnamed: 21"]].copy()
+    wb_items.columns = ["name", "mass"]
+    wb_items["name_clean"] = wb_items["name"].apply(clean_name)
+    wb_items["mass"] = pd.to_numeric(wb_items["mass"], errors="coerce")
+    wb_items = wb_items[(wb_items["name_clean"] != "") & wb_items["mass"].notna()]
+    wb_items = wb_items[~wb_items["name_clean"].str.fullmatch(r"\d+")].reset_index(drop=True)
+ 
+    # --- Объединение ---
+    final = pd.merge(
+        pf_items[["name_clean", "name", "qty", "cost", "code"]],
+        wb_items[["name_clean", "mass"]],
+        on="name_clean",
+        how="left"
+    )
+    final = final[["name", "qty", "mass", "cost", "code"]]
+    final.columns = ["Наименование", "Кол-во", "Масса", "Стоимость", "Код вида товара"]
+    final["Кол-во"] = final["Кол-во"].astype("Int64")
+    final["Масса"] = final["Масса"].round(2)
+    final["Стоимость"] = final["Стоимость"].astype("Int64")
+ 
+    # --- Сохранение ---
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        final.to_excel(writer, index=False, sheet_name="Итог")
+ 
+    print(f"Итоговая таблица сохранена: {os.path.abspath(output_path)}")
+ 
+# Если хотите запускать из командной строки:
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    if len(sys.argv) < 3:
+        print("Использование: python merge_tables.py Счет-проформа.xlsx Накладная.xlsx [Итог.xlsx]")
+    else:
+        proforma_file = sys.argv[1]
+        waybill_file = sys.argv[2]
+        output_file = sys.argv[3] if len(sys.argv) > 3 else "Итоговая таблица.xlsx"
+        build_final(proforma_file, waybill_file, output_file)

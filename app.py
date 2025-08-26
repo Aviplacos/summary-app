@@ -50,7 +50,9 @@ raw_torg = None
 
 def auto_code(name: str) -> str:
     """Автоподстановка кода по названию (только диван/стул/пуф/банкетка)"""
-    n = name.lower()
+    if not name:
+        return "—"
+    n = str(name).lower()
     if "диван" in n:
         return "9401410000"
     if "стул" in n:
@@ -78,14 +80,14 @@ def parse_upd(file):
                     continue
                 code = None
                 for cell in row:
-                    if cell and cell.strip().isdigit() and len(cell.strip()) == 10:
+                    if isinstance(cell, str) and cell.strip().isdigit() and len(cell.strip()) == 10:
                         code = cell.strip()
-                name = row[1]
+                name = row[1] if len(row) > 1 else ""
                 if not code:
                     code = auto_code(name)
                 qty, cost = None, None
                 for cell in row:
-                    if not cell:
+                    if not isinstance(cell, str):
                         continue
                     val = cell.replace(" ", "").replace(",", ".")
                     try:
@@ -120,7 +122,7 @@ def parse_torg(file):
                 name = row[1]
                 weight = None
                 for cell in row:
-                    if not cell:
+                    if not isinstance(cell, str):
                         continue
                     val = cell.replace(" ", "").replace(",", ".")
                     try:
@@ -134,10 +136,12 @@ def parse_torg(file):
 
 
 def build_summary(upd_df, torg_df):
+    if upd_df.empty:
+        return upd_df
     df = pd.merge(upd_df, torg_df, on="Наименование", how="left")
-    total_mass = df["Масса нетто (кг)"].sum()
-    total_qty = df["Кол-во"].sum()
-    total_cost = df["Стоимость (₽)"].sum()
+    total_mass = df["Масса нетто (кг)"].sum(skipna=True)
+    total_qty = df["Кол-во"].sum(skipna=True)
+    total_cost = df["Стоимость (₽)"].sum(skipna=True)
     df.loc[len(df)] = ["ИТОГО", "-", total_qty, total_cost, total_mass]
     return df
 
@@ -154,7 +158,10 @@ def index():
             upd_df, debug_upd, raw_upd = parse_upd(upd_file)
             torg_df, debug_torg, raw_torg = parse_torg(torg_file)
             summary_df = build_summary(upd_df, torg_df)
-            table_html = summary_df.to_html(index=False, float_format="%.2f")
+            if not summary_df.empty:
+                table_html = summary_df.to_html(index=False, float_format="%.2f")
+            else:
+                table_html = "<p>⚠️ Не удалось распознать данные из PDF.</p>"
             debug_output = debug_upd + "\n" + debug_torg
     return render_template_string(HTML_TEMPLATE, table=table_html, debug=debug_output)
 
@@ -162,7 +169,7 @@ def index():
 @app.route("/download")
 def download():
     global summary_df
-    if summary_df is None:
+    if summary_df is None or summary_df.empty:
         return "Нет данных, сначала загрузите файлы."
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:

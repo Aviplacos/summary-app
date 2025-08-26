@@ -18,12 +18,14 @@ UPLOAD_FORM = """
 """
 
 def extract_tnved(text):
+    """Ищет 10-значный код ТНВЭД в тексте"""
     match = re.search(r"\b\d{10}\b", str(text))
     return match.group(0) if match else None
 
 def make_summary(invoice_file, waybill_file):
-    df_invoice = pd.read_excel(invoice_file)
-    df_waybill = pd.read_excel(waybill_file)
+    # читаем с 9-й строки (skiprows=8 значит пропустить первые 8 строк)
+    df_invoice = pd.read_excel(invoice_file, skiprows=8)
+    df_waybill = pd.read_excel(waybill_file, skiprows=8)
 
     # --- обработка счета ---
     invoice_data = []

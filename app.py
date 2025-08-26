@@ -18,6 +18,7 @@ HTML_TEMPLATE = """
     table { border-collapse: collapse; width: 100%; }
     th, td { border: 1px solid #999; padding: 6px; text-align: left; }
     th { background: #eee; }
+    .note { color: #666; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -30,6 +31,7 @@ HTML_TEMPLATE = """
   {% if table %}
     <h2>Сводная таблица товаров</h2>
     {{ table|safe }}
+    <p class="note">Основа — ТОРГ-12: все поля, кроме «Код вида товара», взяты из накладной. Код подтянут из УПД.</p>
     <br>
     <a href="/download">📥 Скачать Excel</a>
   {% endif %}
@@ -39,10 +41,10 @@ HTML_TEMPLATE = """
 
 summary_df = None
 
-# ---------------- helpers ----------------
+# ---------- Helpers ----------
 
 def safe_float(val):
-    """Безопасно приводим значение к float (учитываем пробелы, запятые)."""
+    """Безопасно приводим значение к float (учитываем пробелы/неразрывные, запятые)."""
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -54,14 +56,6 @@ def safe_float(val):
         except Exception:
             return None
     return None
-
-
-def extract_10_digit_code(cell):
-    """Извлекаем из ячейки 10-значный код (оставляем только цифры). Если не 10 цифр — None."""
-    if cell is None:
-        return None
-    digits = re.sub(r"\D", "", str(cell))
-    return digits if len(digits) == 10 else None
 
 
 def cleanup_text(x: str) -> str:
@@ -76,37 +70,36 @@ def has_letters(s: str) -> bool:
     return bool(re.search(r"[A-Za-zА-Яа-яЁё]", s or ""))
 
 
-def word_count(s: str) -> int:
-    if not s:
-        return 0
-    # Считаем слова как последовательности букв/цифр длиной >=1
-    tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", s)
-    return len(tokens)
-
-
-def is_total_row(name: str) -> bool:
+def is_header_or_total(name: str) -> bool:
     n = (name or "").lower()
-    return any(k in n for k in ["итого", "всего", "сумма", "к оплате"])
+    return any(k in n for k in [
+        "наименование", "товар", "итого", "всего", "сумма", "к оплате", "по счету"
+    ])
+
+
+def extract_10_digit_code(cell):
+    """Извлекаем из ячейки ровно 10 цифр, иначе None."""
+    if cell is None:
+        return None
+    digits = re.sub(r"\D", "", str(cell))
+    return digits if len(digits) == 10 else None
+
+
+def normalize_key(name: str) -> str:
+    """Ключ для склейки: нижний регистр + схлопнутые пробелы + без лишней пунктуации на краях."""
+    s = cleanup_text(name).lower()
+    s = re.sub(r"\s+", " ", s).strip(" ,.;:-")
+    return s
 
 
 def get_cell(row, idx):
     return row[idx] if (row is not None and isinstance(row, (list, tuple)) and 0 <= idx < len(row)) else None
 
 
-def normalize_key(name: str) -> str:
-    """Ключ для склейки: нижний регистр + схлопнутые пробелы."""
-    s = cleanup_text(name).lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-# ---------------- parsers ----------------
-
 def iter_rows(page):
-    """Аккуратно обходим все таблицы на странице."""
-    # Сначала пытаемся извлечь несколько таблиц
+    """Обходим все таблицы на странице устойчиво к разрывам."""
     tables = page.extract_tables() or []
     if not tables:
-        # на всякий случай – одиночная таблица
         one = page.extract_table()
         if one:
             tables = [one]
@@ -116,59 +109,46 @@ def iter_rows(page):
         for row in t:
             yield row
 
+# ---------- Parsing ----------
 
 def parse_upd(file):
     """
-    УПД по RAW:
-      name -> col 3, code -> col 4, qty -> col 7, cost -> col 9.
-    Правила:
-      - Код только из col 4, строго 10 цифр, иначе '—' (строку не отбрасываем).
-      - Наименование должно содержать > 2 слов.
+    УПД: нам нужны только пары (Наименование -> Код вида товара).
+    По RAW ранее: name -> col 3, code -> col 4.
+    Код валиден только если 10 цифр.
     """
-    rows = []
+    pairs = []
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             for row in iter_rows(page):
                 if not row:
                     continue
-
-                raw_name = cleanup_text(get_cell(row, 3))
-                raw_code = get_cell(row, 4)
-
-                # Код
-                code = extract_10_digit_code(raw_code) or "—"
-
-                # Наименование: если в col 3 слов <= 2, ищем альтернативу в строке
-                name = raw_name
-                if word_count(name) <= 2 or not has_letters(name):
-                    for cell in row:
-                        cand = cleanup_text(cell)
-                        if has_letters(cand) and word_count(cand) > 2:
-                            name = cand
-                            break
-
-                # Фильтры по наименованию
-                if not name or word_count(name) <= 2 or is_total_row(name):
+                name = cleanup_text(get_cell(row, 3))
+                if not name or not has_letters(name) or is_header_or_total(name):
                     continue
+                code = extract_10_digit_code(get_cell(row, 4))
+                if code:
+                    pairs.append((normalize_key(name), code))
 
-                qty = safe_float(get_cell(row, 7))
-                cost = safe_float(get_cell(row, 9))
-                if qty is None or cost is None:
-                    continue
+    if not pairs:
+        return pd.DataFrame(columns=["__key__", "Код вида товара"])
 
-                rows.append([code, name, qty, cost])
-
-    df = pd.DataFrame(rows, columns=["Код вида товара", "Наименование", "Кол-во", "Стоимость (₽)"])
-    if not df.empty:
-        df["__key__"] = df["Наименование"].apply(normalize_key)
+    # Если на одно имя встречается несколько кодов — берём последний (как «самый нижний» в документе).
+    df = pd.DataFrame(pairs, columns=["__key__", "Код вида товара"])
+    df = df.drop_duplicates(subset="__key__", keep="last")
     return df
 
 
 def parse_torg(file):
     """
-    ТОРГ-12 по RAW:
-      name -> col 1, mass -> col 9.
-    Наименование также должно содержать > 2 слов.
+    ТОРГ-12: это «источник истины» по позициям.
+    Извлекаем для каждой строки:
+      - Наименование (обычно col 1; если пусто — берём первую текстовую ячейку с буквами)
+      - Кол-во (пытаемся col 6; если нет — первое число после имени)
+      - Стоимость (пытаемся взять «самое большое» число в строке, исключая массу и код)
+      - Масса нетто (пытаемся col 9; если нет — None)
+    ВАЖНО: строки не фильтруем по длине названия; удаляем только явные заголовки/итоги.
+    Порядок строк сохраняем как в ТОРГ-12.
     """
     rows = []
     with pdfplumber.open(file) as pdf:
@@ -176,67 +156,115 @@ def parse_torg(file):
             for row in iter_rows(page):
                 if not row:
                     continue
-                name = cleanup_text(get_cell(row, 1))
-                if not name or word_count(name) <= 2 or is_total_row(name):
-                    continue
-                mass = safe_float(get_cell(row, 9))
-                if mass is None:
-                    continue
-                rows.append([name, mass])
 
-    df = pd.DataFrame(rows, columns=["Наименование", "Масса нетто (кг)"])
-    if not df.empty:
-        df["__key__"] = df["Наименование"].apply(normalize_key)
+                # Наименование
+                name = cleanup_text(get_cell(row, 1))
+                if not has_letters(name):
+                    # ищем первую ячейку с буквами
+                    for cell in row:
+                        cand = cleanup_text(cell)
+                        if has_letters(cand):
+                            name = cand
+                            break
+
+                if not name or is_header_or_total(name):
+                    continue  # явные заголовки/итоги
+
+                # Масса (по опыту — col 9)
+                weight = safe_float(get_cell(row, 9))
+
+                # Собираем все числа для эвристик количества/стоимости
+                numbers = []
+                for i, cell in enumerate(row):
+                    # исключим потенциальную ячейку кода вида (index 4) — там 10 цифр склеенных,
+                    # и она не должна попадать как число
+                    if i == 4:
+                        continue
+                    num = safe_float(cell)
+                    if num is not None:
+                        numbers.append((i, num))
+
+                # Кол-во: сначала пробуем col 6, иначе первое число ПОСЛЕ имени
+                qty = safe_float(get_cell(row, 6))
+                if qty is None:
+                    # определим индекс ячейки имени
+                    name_idx = None
+                    for i, cell in enumerate(row):
+                        if cleanup_text(cell) == name:
+                            name_idx = i
+                            break
+                    # берём первое число после имени
+                    for i, num in numbers:
+                        if name_idx is None or i > name_idx:
+                            qty = num
+                            break
+
+                # Стоимость: если есть числа — берём максимальное (обычно «Сумма» > «Цена»)
+                cost = None
+                if numbers:
+                    # если вес считался (col 9), исключим его из кандидатов на стоимость
+                    candidates = [(i, n) for i, n in numbers if not (i == 9 and weight is not None and n == weight)]
+                    if candidates:
+                        cost = max(candidates, key=lambda x: x[1])[1]
+
+                rows.append([name, qty, cost, weight])
+
+    # Даже если qty/cost/weight не распознаны — строку оставляем (с None)
+    df = pd.DataFrame(rows, columns=["Наименование", "Кол-во", "Стоимость (₽)", "Масса нетто (кг)"])
+    # Нормализованный ключ для склейки с УПД
+    df["__key__"] = df["Наименование"].apply(normalize_key)
     return df
 
-# ---------------- summary ----------------
 
-def build_summary(upd_df, torg_df):
-    if upd_df.empty:
-        return upd_df
-
-    # Слейка по нормализованному ключу (оставляем имена из УПД)
+def build_summary(torg_df, upd_codes_df):
+    """
+    Финальная таблица: основана ТОЛЬКО на строках ТОРГ-12.
+    Подставляем коды из УПД по нормализованному имени.
+    Кол-во строк в результате == кол-ву строк ТОРГ-12 (после удаления заголовков/итогов).
+    """
     df = pd.merge(
-        upd_df,
-        torg_df[["__key__", "Масса нетто (кг)"]],
+        torg_df,
+        upd_codes_df[["__key__", "Код вида товара"]] if not upd_codes_df.empty else pd.DataFrame(columns=["__key__", "Код вида товара"]),
         on="__key__",
-        how="left",
-        suffixes=("", "_t")
+        how="left"
     )
-    df.drop(columns=["__key__"], inplace=True)
 
-    # Нумерация
+    # Если кода нет — ставим "—"
+    df["Код вида товара"] = df["Код вида товара"].fillna("—")
+
+    # Переупорядочим колонки и добавим нумерацию
+    df = df[["Код вида товара", "Наименование", "Кол-во", "Стоимость (₽)", "Масса нетто (кг)"]]
     df.insert(0, "№", range(1, len(df) + 1))
 
-    # ИТОГО
+    # Итоги
     total_qty = df["Кол-во"].sum(skipna=True)
     total_cost = df["Стоимость (₽)"].sum(skipna=True)
     total_mass = df["Масса нетто (кг)"].sum(skipna=True)
+    df.loc[len(df)] = ["—", "ИТОГО", "-", total_qty, total_cost, total_mass]
 
-    # Порядок колонок уже: №, Код, Наименование, Кол-во, Стоимость, Масса
-    df.loc[len(df)] = ["—", "—", "ИТОГО", total_qty, total_cost, total_mass]
     return df
 
-# ---------------- web ----------------
+# ---------- Web ----------
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     global summary_df
     table_html = None
+
     if request.method == "POST":
         upd_file = request.files.get("upd")
         torg_file = request.files.get("torg")
 
         if not upd_file or not torg_file:
-            return render_template_string(HTML_TEMPLATE, table="<p>Загрузите оба PDF.</p>")
+            return render_template_string(HTML_TEMPLATE, table="<p>Загрузите оба PDF файла (УПД и ТОРГ-12).</p>")
 
-        upd_df = parse_upd(upd_file)
+        upd_codes_df = parse_upd(upd_file)
         torg_df = parse_torg(torg_file)
 
-        if upd_df.empty:
-            table_html = "<p>Не удалось извлечь строки УПД по заданным правилам.</p>"
+        if torg_df.empty:
+            table_html = "<p>Не удалось извлечь позиции из ТОРГ-12.</p>"
         else:
-            summary_df = build_summary(upd_df, torg_df)
+            summary_df = build_summary(torg_df, upd_codes_df)
             table_html = summary_df.to_html(index=False, float_format="%.2f")
 
     return render_template_string(HTML_TEMPLATE, table=table_html)

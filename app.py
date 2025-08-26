@@ -1,98 +1,122 @@
+import os
+import io
 import pandas as pd
-import re
-from flask import Flask, request, send_file, render_template_string
-from io import BytesIO
+import pdfplumber
+from flask import Flask, request, render_template_string, send_file
 
 app = Flask(__name__)
 
-# === HTML форма для загрузки файлов ===
-UPLOAD_FORM = """
+HTML_TEMPLATE = """
 <!doctype html>
-<title>Сводная таблица</title>
-<h2>Загрузите два Excel файла</h2>
-<form method=post enctype=multipart/form-data>
-  <p><input type=file name=invoice>
-     <input type=file name=waybill>
-     <input type=submit value="Сформировать сводную таблицу">
-</form>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Сводная таблица</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #999; padding: 6px; text-align: left; }
+    th { background: #eee; }
+  </style>
+</head>
+<body>
+  <h2>Загрузка документов</h2>
+  <form action="/" method="post" enctype="multipart/form-data">
+    УПД (PDF): <input type="file" name="upd"><br><br>
+    ТОРГ-12 (PDF): <input type="file" name="torg"><br><br>
+    <input type="submit" value="Обработать">
+  </form>
+  {% if table %}
+    <h2>Сводная таблица товаров</h2>
+    {{ table|safe }}
+    <br>
+    <a href="/download">📥 Скачать Excel</a>
+  {% endif %}
+</body>
+</html>
 """
 
-def extract_tnved(text):
-    match = re.search(r"\b\d{10}\b", str(text))
-    return match.group(0) if match else None
+summary_df = None  # глобальная таблица
 
-def make_summary(invoice_file, waybill_file):
-    df_invoice = pd.read_excel(invoice_file)
-    df_waybill = pd.read_excel(waybill_file)
 
-    # --- обработка счета ---
-    invoice_data = []
-    for _, row in df_invoice.iterrows():
-        line = " ".join(str(v) for v in row if pd.notna(v))
-        tnved = extract_tnved(line)
-        if tnved:
-            parts = line.split(tnved)
-            name = parts[0].strip().split(maxsplit=1)[-1]
-            qty = pd.to_numeric(row.astype(str).str.replace(",", "."), errors="coerce").dropna()
-            quantity = int(qty.iloc[0]) if not qty.empty else None
-            cost = qty.iloc[-1] if len(qty) > 1 else None
-            invoice_data.append({
-                "№ п/п": len(invoice_data) + 1,
-                "Код ТНВЭД": tnved,
-                "Наименование товара": name,
-                "Кол-во": quantity,
-                "Стоимость": cost
-            })
+def parse_upd(file) -> pd.DataFrame:
+    """Читает УПД и возвращает товары: код, наименование, количество, стоимость"""
+    rows = []
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            table = page.extract_table()
+            if not table:
+                continue
+            for row in table:
+                # ищем строки с кодом из 10 цифр
+                for cell in row:
+                    if cell and cell.strip().isdigit() and len(cell.strip()) == 10:
+                        try:
+                            code = cell.strip()
+                            name = row[1]
+                            qty = float(row[3].replace(",", "."))
+                            cost = float(row[5].replace(",", "."))
+                            rows.append([code, name, qty, cost])
+                        except Exception:
+                            continue
+    return pd.DataFrame(rows, columns=["Код вида товара", "Наименование", "Кол-во", "Стоимость (₽)"])
 
-    df_invoice_clean = pd.DataFrame(invoice_data)
 
-    # --- обработка накладной (вес) ---
-    waybill_data = []
-    for _, row in df_waybill.iterrows():
-        line = " ".join(str(v) for v in row if pd.notna(v))
-        tnved = extract_tnved(line)
-        if tnved:
-            qty = pd.to_numeric(row.astype(str).str.replace(",", "."), errors="coerce").dropna()
-            weight = qty.iloc[-1] if not qty.empty else None
-            waybill_data.append({
-                "Код ТНВЭД": tnved,
-                "Вес (кг)": weight
-            })
+def parse_torg(file) -> pd.DataFrame:
+    """Читает ТОРГ-12 и возвращает веса товаров"""
+    rows = []
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            table = page.extract_table()
+            if not table:
+                continue
+            for row in table:
+                try:
+                    name = row[1]
+                    weight = float(row[4].replace(",", "."))
+                    rows.append([name, weight])
+                except Exception:
+                    continue
+    return pd.DataFrame(rows, columns=["Наименование", "Масса нетто (кг)"])
 
-    df_waybill_clean = pd.DataFrame(waybill_data)
 
-    # --- объединяем ---
-    df_summary = df_invoice_clean.merge(df_waybill_clean, on="Код ТНВЭД", how="left")
+def build_summary(upd_df, torg_df):
+    """Собирает сводную таблицу по наименованию"""
+    df = pd.merge(upd_df, torg_df, on="Наименование", how="left")
+    # Итоги
+    total_mass = df["Масса нетто (кг)"].sum()
+    total_qty = df["Кол-во"].sum()
+    total_cost = df["Стоимость (₽)"].sum()
+    df.loc[len(df)] = ["ИТОГО", "-", total_qty, total_cost, total_mass]
+    return df
 
-    # --- добавляем итого ---
-    totals = {
-        "№ п/п": "ИТОГО",
-        "Код ТНВЭД": "",
-        "Наименование товара": "",
-        "Кол-во": df_summary["Кол-во"].sum(skipna=True),
-        "Стоимость": df_summary["Стоимость"].sum(skipna=True),
-        "Вес (кг)": df_summary["Вес (кг)"].sum(skipna=True)
-    }
-    df_summary = pd.concat([df_summary, pd.DataFrame([totals])], ignore_index=True)
-
-    return df_summary
 
 @app.route("/", methods=["GET", "POST"])
-def upload():
+def index():
+    global summary_df
+    table_html = None
     if request.method == "POST":
-        invoice = request.files.get("invoice")
-        waybill = request.files.get("waybill")
-        if not invoice or not waybill:
-            return "Пожалуйста, загрузите оба файла"
-        df_summary = make_summary(invoice, waybill)
+        upd_file = request.files.get("upd")
+        torg_file = request.files.get("torg")
+        if upd_file and torg_file:
+            upd_df = parse_upd(upd_file)
+            torg_df = parse_torg(torg_file)
+            summary_df = build_summary(upd_df, torg_df)
+            table_html = summary_df.to_html(index=False, float_format="%.2f")
+    return render_template_string(HTML_TEMPLATE, table=table_html)
 
-        # сохраняем в память как Excel
-        output = BytesIO()
-        df_summary.to_excel(output, index=False)
-        output.seek(0)
-        return send_file(output, as_attachment=True, download_name="summary.xlsx")
 
-    return render_template_string(UPLOAD_FORM)
+@app.route("/download")
+def download():
+    global summary_df
+    if summary_df is None:
+        return "Нет данных, сначала загрузите файлы."
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="Сводная")
+    output.seek(0)
+    return send_file(output, download_name="summary.xlsx", as_attachment=True)
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

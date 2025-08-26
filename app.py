@@ -17,6 +17,7 @@ HTML_TEMPLATE = """
     table { border-collapse: collapse; width: 100%; }
     th, td { border: 1px solid #999; padding: 6px; text-align: left; }
     th { background: #eee; }
+    pre { background: #f8f8f8; padding: 10px; border: 1px solid #ccc; }
   </style>
 </head>
 <body>
@@ -30,60 +31,110 @@ HTML_TEMPLATE = """
     <h2>Сводная таблица товаров</h2>
     {{ table|safe }}
     <br>
-    <a href="/download">📥 Скачать Excel</a>
+    <a href="/download">📥 Скачать Excel</a><br>
+    <a href="/download_raw/upd">📥 Скачать сырые данные УПД (CSV)</a><br>
+    <a href="/download_raw/torg">📥 Скачать сырые данные ТОРГ-12 (CSV)</a>
+  {% endif %}
+  {% if debug %}
+    <h2>Отладка (первые строки из PDF)</h2>
+    <pre>{{ debug }}</pre>
   {% endif %}
 </body>
 </html>
 """
 
-summary_df = None  # глобальная таблица
+summary_df = None
+raw_upd = None
+raw_torg = None
 
 
-def parse_upd(file) -> pd.DataFrame:
-    """Читает УПД и возвращает товары: код, наименование, количество, стоимость"""
+def auto_code(name: str) -> str:
+    """Автоподстановка кода по названию (только диван/стул/пуф/банкетка)"""
+    n = name.lower()
+    if "диван" in n:
+        return "9401410000"
+    if "стул" in n:
+        return "9401800009"
+    if "пуф" in n or "банкетка" in n:
+        return "9401800009"
+    return "—"
+
+
+def parse_upd(file):
     rows = []
+    debug = []
+    raw = []
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             table = page.extract_table()
             if not table:
                 continue
+            raw.extend(table)
+            debug.append("=== UPD PAGE ===")
+            for r in table[:10]:
+                debug.append(str(r))
             for row in table:
-                # ищем строки с кодом из 10 цифр
+                if not row or len(row) < 2:
+                    continue
+                code = None
                 for cell in row:
                     if cell and cell.strip().isdigit() and len(cell.strip()) == 10:
-                        try:
-                            code = cell.strip()
-                            name = row[1]
-                            qty = float(row[3].replace(",", "."))
-                            cost = float(row[5].replace(",", "."))
-                            rows.append([code, name, qty, cost])
-                        except Exception:
-                            continue
-    return pd.DataFrame(rows, columns=["Код вида товара", "Наименование", "Кол-во", "Стоимость (₽)"])
+                        code = cell.strip()
+                name = row[1]
+                if not code:
+                    code = auto_code(name)
+                qty, cost = None, None
+                for cell in row:
+                    if not cell:
+                        continue
+                    val = cell.replace(" ", "").replace(",", ".")
+                    try:
+                        num = float(val)
+                        if qty is None:
+                            qty = num
+                        else:
+                            cost = num
+                    except:
+                        continue
+                if name and qty and cost:
+                    rows.append([code, name, qty, cost])
+    return pd.DataFrame(rows, columns=["Код вида товара", "Наименование", "Кол-во", "Стоимость (₽)"]), "\n".join(debug), raw
 
 
-def parse_torg(file) -> pd.DataFrame:
-    """Читает ТОРГ-12 и возвращает веса товаров"""
+def parse_torg(file):
     rows = []
+    debug = []
+    raw = []
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             table = page.extract_table()
             if not table:
                 continue
+            raw.extend(table)
+            debug.append("=== TORG PAGE ===")
+            for r in table[:10]:
+                debug.append(str(r))
             for row in table:
-                try:
-                    name = row[1]
-                    weight = float(row[4].replace(",", "."))
-                    rows.append([name, weight])
-                except Exception:
+                if not row or len(row) < 2:
                     continue
-    return pd.DataFrame(rows, columns=["Наименование", "Масса нетто (кг)"])
+                name = row[1]
+                weight = None
+                for cell in row:
+                    if not cell:
+                        continue
+                    val = cell.replace(" ", "").replace(",", ".")
+                    try:
+                        weight = float(val)
+                        break
+                    except:
+                        continue
+                if name and weight:
+                    rows.append([name, weight])
+    return pd.DataFrame(rows, columns=["Наименование", "Масса нетто (кг)"]), "\n".join(debug), raw
 
 
 def build_summary(upd_df, torg_df):
-    """Собирает сводную таблицу по наименованию"""
     df = pd.merge(upd_df, torg_df, on="Наименование", how="left")
-    # Итоги
     total_mass = df["Масса нетто (кг)"].sum()
     total_qty = df["Кол-во"].sum()
     total_cost = df["Стоимость (₽)"].sum()
@@ -93,17 +144,19 @@ def build_summary(upd_df, torg_df):
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    global summary_df
+    global summary_df, raw_upd, raw_torg
     table_html = None
+    debug_output = None
     if request.method == "POST":
         upd_file = request.files.get("upd")
         torg_file = request.files.get("torg")
         if upd_file and torg_file:
-            upd_df = parse_upd(upd_file)
-            torg_df = parse_torg(torg_file)
+            upd_df, debug_upd, raw_upd = parse_upd(upd_file)
+            torg_df, debug_torg, raw_torg = parse_torg(torg_file)
             summary_df = build_summary(upd_df, torg_df)
             table_html = summary_df.to_html(index=False, float_format="%.2f")
-    return render_template_string(HTML_TEMPLATE, table=table_html)
+            debug_output = debug_upd + "\n" + debug_torg
+    return render_template_string(HTML_TEMPLATE, table=table_html, debug=debug_output)
 
 
 @app.route("/download")
@@ -116,6 +169,19 @@ def download():
         summary_df.to_excel(writer, index=False, sheet_name="Сводная")
     output.seek(0)
     return send_file(output, download_name="summary.xlsx", as_attachment=True)
+
+
+@app.route("/download_raw/<kind>")
+def download_raw(kind):
+    global raw_upd, raw_torg
+    raw = raw_upd if kind == "upd" else raw_torg
+    if raw is None:
+        return "Нет данных."
+    df = pd.DataFrame(raw)
+    output = io.BytesIO()
+    df.to_csv(output, index=False, encoding="utf-8-sig")
+    output.seek(0)
+    return send_file(output, download_name=f"raw_{kind}.csv", as_attachment=True)
 
 
 if __name__ == "__main__":

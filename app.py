@@ -34,7 +34,7 @@ def parse_torg12(text: str):
             "Количество": ru2f(m.group(7)),
             "Стоимость": ru2f(m.group(9)),
         })
-    return pd.DataFrame(rows).sort_values("№").reset_index(drop=True)
+    return pd.DataFrame(rows)
 
 def parse_upd(text: str):
     pattern = re.compile(
@@ -45,12 +45,16 @@ def parse_upd(text: str):
 
 def build_table(torg_text: str, upd_text: str):
     df_torg = parse_torg12(torg_text)
+    if df_torg.empty:
+        # Отдаем пользователю первые строки файла для диагностики
+        preview = "\n".join(torg_text.splitlines()[:20])
+        raise ValueError("Не удалось распарсить ТОРГ-12. Вот начало файла:\n\n" + preview)
+
     upd_map = parse_upd(upd_text)
     df_torg["Код вида товара"] = df_torg["Код товара"].map(upd_map).fillna("--")
 
     df = df_torg[["№", "Код вида товара", "Код товара", "Наименование", "Масса", "Количество", "Стоимость"]]
 
-    # Итоги
     sum_mass = df["Масса"].sum()
     sum_qty = df["Количество"].sum()
     sum_cost = df["Стоимость"].sum()
@@ -87,7 +91,7 @@ def index():
         </form>
         """)
     except Exception as e:
-        return f"<h3 style='color:red'>Ошибка обработки: {str(e)}</h3>"
+        return f"<pre style='color:red; white-space: pre-wrap'>{str(e)}</pre>"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

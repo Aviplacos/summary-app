@@ -1,97 +1,125 @@
 import os
-import re
+from flask import Flask, render_template_string, send_from_directory, abort
 import pandas as pd
-from flask import Flask, request, send_file, render_template_string
+
+APP_TITLE = "Итоговая таблица (накладная + коды из УПД)"
+EXCEL_PATH = os.environ.get("EXCEL_PATH", "Итоговая_таблица.xlsx")
 
 app = Flask(__name__)
 
-def ru2f(s: str) -> float:
-    """Преобразует числа с запятой и пробелами в float"""
-    return float(s.replace(" ","").replace(" ","").replace(",", "."))
+TABLE_TEMPLATE = """
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>{{ title }}</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      h1 { font-size: 20px; margin: 0 0 12px; }
+      .actions { margin: 0 0 16px; }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+      th { background: #f6f6f6; text-align: left; }
+      tr:nth-child(even) td { background: #fbfbfb; }
+      .nowrap { white-space: nowrap; }
+      .muted { color: #666; font-size: 14px; }
+      .footer { margin-top: 16px; }
+      .chip { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef; color:#334; font-size:12px; }
+      .total-row td { font-weight: 700; background: #fff8e1; }
+      @media (max-width: 900px) { table { font-size: 14px; } }
+      .container { max-width: 1400px; margin: 0 auto; }
+      a.btn { display:inline-block; padding:6px 10px; border-radius:6px; border:1px solid #bbb; text-decoration:none; color:#222; background:#fff; }
+      a.btn:hover { background:#f3f3f3; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>{{ title }}</h1>
+      <div class="actions">
+        <span class="chip">строк (товаров): {{ rows_count }}</span>
+        {% if excel_exists %}
+        &nbsp; <a class="btn" href="/download" title="Скачать исходный Excel">Скачать Excel</a>
+        {% endif %}
+      </div>
+      {{ table_html|safe }}
+      <div class="footer muted">
+        /health → OK • Стартовый файл: {{ excel_path }}
+      </div>
+    </div>
+  </body>
+</html>
+"""
 
-def parse_torg12(text: str):
-    row_re = re.compile(
-        r'^\s*(\d+)\s+'           
-        r'(.+?)\s+'                
-        r'([A-ZА-Я0-9\-]+)\s+'     
-        r'шт\s+796\s+\S+\s+'       
-        r'([\d,]+)\s+'             
-        r'([\d,]+)\s+'             
-        r'([\d,]+)\s+'             
-        r'([\d,]+)\s+'             
-        r'(\d[\d\s]*,\d{2})\s+'    
-        r'(\d[\d\s]*,\d{2})\s+0%', 
-        re.MULTILINE
+def load_table():
+    if not os.path.exists(EXCEL_PATH):
+        return None, False
+    df = pd.read_excel(EXCEL_PATH)
+    # Нормализуем имена колонок на случай иных регистров/пробелов
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Подсветка строки "Итого" (если есть)
+    is_total = df.iloc[:, 0].astype(str).str.lower().eq("итого")
+    # Чтобы точнее — ищем столбец «№»:
+    if "№" in df.columns:
+        is_total = df["№"].astype(str).str.lower().eq("итого")
+
+    # Сформируем HTML-таблицу
+    # Сохраняем формат значений из файла (pandas сам приведёт их к строкам в to_html)
+    table_html = df.to_html(
+        index=False,
+        escape=False,
+        border=0,
+        classes="dataframe"
     )
 
-    rows = []
-    for m in row_re.finditer(text):
-        rows.append({
-            "№": int(m.group(1)),
-            "Наименование": m.group(2).strip(),
-            "Код товара": m.group(3).strip(),
-            "Масса": ru2f(m.group(6)),
-            "Количество": ru2f(m.group(7)),
-            "Стоимость": ru2f(m.group(9)),
-        })
-    return pd.DataFrame(rows)
+    # Вставим CSS-класс для итоговой строки
+    if is_total.any():
+        # грубая замена: найдём текст ячейки "Итого" и окрасим её строку
+        # (для простоты, заменим <tr><td>Итого на <tr class="total-row"><td>Итого)
+        table_html = table_html.replace("<tr>\n      <td>Итого</td>",
+                                        '<tr class="total-row">\n      <td>Итого</td>')
 
-def parse_upd(text: str):
-    pattern = re.compile(
-        r'([A-ZА-Я0-9\-]+)\s+\d+\s+[^\n]+?\s+([0-9]{8,12}|--)\s+796\s+шт\s+[\d,]+\s+\d[\d\s]*,\d{2}',
-        re.MULTILINE
-    )
-    return {c.strip(): kv.strip() for c, kv in pattern.findall(text)}
+    return table_html, True
 
-def build_table(torg_text: str, upd_text: str):
-    df_torg = parse_torg12(torg_text)
-    if df_torg.empty:
-        # Отдаем пользователю первые строки файла для диагностики
-        preview = "\n".join(torg_text.splitlines()[:20])
-        raise ValueError("Не удалось распарсить ТОРГ-12. Вот начало файла:\n\n" + preview)
-
-    upd_map = parse_upd(upd_text)
-    df_torg["Код вида товара"] = df_torg["Код товара"].map(upd_map).fillna("--")
-
-    df = df_torg[["№", "Код вида товара", "Код товара", "Наименование", "Масса", "Количество", "Стоимость"]]
-
-    sum_mass = df["Масса"].sum()
-    sum_qty = df["Количество"].sum()
-    sum_cost = df["Стоимость"].sum()
-    df.loc[len(df)] = ["ИТОГО", "", "", "", round(sum_mass, 2), int(sum_qty), round(sum_cost, 2)]
-
-    return df
-
-@app.route("/", methods=["GET", "POST"])
+@app.route("/")
 def index():
-    try:
-        if request.method == "POST":
-            torg_file = request.files["torg12"]
-            upd_file = request.files["upd"]
+    table_html, ok = load_table()
+    rows_count = "-"
+    if ok:
+        try:
+            # пересчёт количества товарных строк без "Итого"
+            df = pd.read_excel(EXCEL_PATH)
+            if "№" in df.columns:
+                rows_count = int((df["№"].astype(str).str.lower() != "итого").sum())
+            else:
+                rows_count = len(df)
+        except Exception:
+            pass
 
-            if not torg_file or not upd_file:
-                return "Ошибка: Загрузите оба файла (ТОРГ-12 и УПД)."
+    if not ok:
+        msg = f"""
+        <p>Файл <code>{EXCEL_PATH}</code> не найден в корне приложения.</p>
+        <p>Положите Excel с таблицей рядом с <code>app.py</code> или задайте путь через переменную окружения <code>EXCEL_PATH</code>.</p>
+        """
+        return render_template_string(TABLE_TEMPLATE, title=APP_TITLE, table_html=msg,
+                                      rows_count=rows_count, excel_exists=False, excel_path=EXCEL_PATH)
 
-            torg_text = torg_file.read().decode("utf-8", errors="ignore")
-            upd_text = upd_file.read().decode("utf-8", errors="ignore")
+    return render_template_string(TABLE_TEMPLATE, title=APP_TITLE, table_html=table_html,
+                                  rows_count=rows_count, excel_exists=True, excel_path=EXCEL_PATH)
 
-            df = build_table(torg_text, upd_text)
+@app.route("/download")
+def download():
+    if not os.path.exists(EXCEL_PATH):
+        abort(404)
+    dirname = os.path.dirname(EXCEL_PATH) or "."
+    filename = os.path.basename(EXCEL_PATH)
+    return send_from_directory(dirname, filename, as_attachment=True)
 
-            out_xlsx = "output.xlsx"
-            df.to_excel(out_xlsx, index=False)
-
-            return send_file(out_xlsx, as_attachment=True)
-
-        return render_template_string("""
-        <h2>Загрузка ТОРГ-12 и УПД</h2>
-        <form method="post" enctype="multipart/form-data">
-          <p>ТОРГ-12 (txt): <input type="file" name="torg12" required></p>
-          <p>УПД (txt): <input type="file" name="upd" required></p>
-          <p><input type="submit" value="Обработать"></p>
-        </form>
-        """)
-    except Exception as e:
-        return f"<pre style='color:red; white-space: pre-wrap'>{str(e)}</pre>"
+@app.route("/health")
+def health():
+    return "OK", 200
 
 if __name__ == "__main__":
+    # Локальный запуск: python app.py
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

@@ -83,6 +83,11 @@ def parse_upd(file):
 
                 code = extract_10_digit_code(row[4]) or "—"
                 name = str(row[3]).strip() if row[3] else ""
+
+                # фильтр: если имя короче 4 символов — пропускаем
+                if len(name) < 4:
+                    continue
+
                 qty = safe_float(row[7])
                 cost = safe_float(row[9])
 
@@ -108,6 +113,11 @@ def parse_torg(file):
                 if not row or len(row) < 10:
                     continue
                 name = str(row[1]).strip() if row[1] else ""
+
+                # фильтр: если имя короче 4 символов — пропускаем
+                if len(name) < 4:
+                    continue
+
                 weight = safe_float(row[9])
                 if name and weight is not None:
                     rows.append([name, weight])
@@ -116,10 +126,13 @@ def parse_torg(file):
 
 def build_summary(upd_df, torg_df):
     df = pd.merge(upd_df, torg_df, on="Наименование", how="left")
+    # Добавляем нумерацию строк
+    df.insert(0, "№", range(1, len(df) + 1))
+    # Итог
     total_mass = df["Масса нетто (кг)"].sum(skipna=True)
     total_qty = df["Кол-во"].sum(skipna=True)
     total_cost = df["Стоимость (₽)"].sum(skipna=True)
-    df.loc[len(df)] = ["ИТОГО", "-", total_qty, total_cost, total_mass]
+    df.loc[len(df)] = ["ИТОГО", "-", "-", total_qty, total_cost, total_mass]
     return df
 
 

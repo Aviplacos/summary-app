@@ -1,98 +1,118 @@
+from flask import Flask, render_template, request, jsonify
 import pandas as pd
-import re
-from flask import Flask, request, send_file, render_template_string
-from io import BytesIO
+import os
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-# === HTML форма для загрузки файлов ===
-UPLOAD_FORM = """
-<!doctype html>
-<title>Сводная таблица</title>
-<h2>Загрузите два Excel файла</h2>
-<form method=post enctype=multipart/form-data>
-  <p><input type=file name=invoice>
-     <input type=file name=waybill>
-     <input type=submit value="Сформировать сводную таблицу">
-</form>
-"""
+# Создаем папку для загрузок если не существует
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-def extract_tnved(text):
-    match = re.search(r"\b\d{10}\b", str(text))
-    return match.group(0) if match else None
-
-def make_summary(invoice_file, waybill_file):
-    df_invoice = pd.read_excel(invoice_file)
-    df_waybill = pd.read_excel(waybill_file)
-
-    # --- обработка счета ---
-    invoice_data = []
-    for _, row in df_invoice.iterrows():
-        line = " ".join(str(v) for v in row if pd.notna(v))
-        tnved = extract_tnved(line)
-        if tnved:
-            parts = line.split(tnved)
-            name = parts[0].strip().split(maxsplit=1)[-1]
-            qty = pd.to_numeric(row.astype(str).str.replace(",", "."), errors="coerce").dropna()
-            quantity = int(qty.iloc[0]) if not qty.empty else None
-            cost = qty.iloc[-1] if len(qty) > 1 else None
-            invoice_data.append({
-                "№ п/п": len(invoice_data) + 1,
-                "Код ТНВЭД": tnved,
-                "Наименование товара": name,
-                "Кол-во": quantity,
-                "Стоимость": cost
+def process_files(proforma_file, invoice_file):
+    """Обработка файлов счет-проформы и накладной"""
+    try:
+        # Чтение счет-проформы
+        proforma_df = pd.read_excel(proforma_file, header=None)
+        
+        # Поиск данных товаров в счет-проформе
+        goods_data = []
+        for index, row in proforma_df.iterrows():
+            if isinstance(row[2], str) and any(keyword in row[2] for keyword in [
+                'Диван', 'Кресло', 'Комод', 'Сервант', 'Тумбочка', 'Туалетный', 
+                'Зеркало', 'Кровать', 'Шкаф', 'ПУФ', 'Стол', 'Стул'
+            ]):
+                code = proforma_df.iloc[index, 8] if len(proforma_df.columns) > 8 else ''
+                name = row[2]
+                quantity = proforma_df.iloc[index, 18] if len(proforma_df.columns) > 18 else 0
+                price = proforma_df.iloc[index, 22] if len(proforma_df.columns) > 22 else 0
+                cost = proforma_df.iloc[index, 27] if len(proforma_df.columns) > 27 else 0
+                
+                if code and str(code).startswith(('70', '94')) and len(str(code)) == 10:
+                    goods_data.append({
+                        'code': str(code),
+                        'name': name,
+                        'quantity': quantity,
+                        'cost': cost
+                    })
+        
+        # Чтение накладной
+        invoice_df = pd.read_excel(invoice_file, header=None)
+        
+        # Поиск данных о массе в накладной
+        mass_data = {}
+        for index, row in invoice_df.iterrows():
+            if isinstance(row[0], str) and any(keyword in row[0] for keyword in [
+                'Диван', 'Кресло', 'Комод', 'Сервант', 'Тумбочка', 'Туалетный', 
+                'Зеркало', 'Кровать', 'Шкаф', 'ПУФ', 'Стол', 'Стул'
+            ]):
+                name = row[0]
+                mass = invoice_df.iloc[index, 8] if len(invoice_df.columns) > 8 else 0
+                mass_data[name] = mass
+        
+        # Сборка итоговой таблицы
+        result = []
+        for i, item in enumerate(goods_data, 1):
+            mass = mass_data.get(item['name'], 0)
+            result.append({
+                '№': i,
+                'Код ТНВЭД': item['code'],
+                'Наименование': item['name'],
+                'Масса': round(float(mass), 2) if mass else 0,
+                'Количество': int(item['quantity']),
+                'Стоимость': int(item['cost'])
             })
+        
+        return result
+        
+    except Exception as e:
+        raise Exception(f"Ошибка обработки файлов: {str(e)}")
 
-    df_invoice_clean = pd.DataFrame(invoice_data)
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-    # --- обработка накладной (вес) ---
-    waybill_data = []
-    for _, row in df_waybill.iterrows():
-        line = " ".join(str(v) for v in row if pd.notna(v))
-        tnved = extract_tnved(line)
-        if tnved:
-            qty = pd.to_numeric(row.astype(str).str.replace(",", "."), errors="coerce").dropna()
-            weight = qty.iloc[-1] if not qty.empty else None
-            waybill_data.append({
-                "Код ТНВЭД": tnved,
-                "Вес (кг)": weight
-            })
+@app.route('/upload', methods=['POST'])
+def upload_files():
+    if 'proforma' not in request.files or 'invoice' not in request.files:
+        return jsonify({'error': 'Необходимо загрузить оба файла'}), 400
+    
+    proforma_file = request.files['proforma']
+    invoice_file = request.files['invoice']
+    
+    if proforma_file.filename == '' or invoice_file.filename == '':
+        return jsonify({'error': 'Файлы не выбраны'}), 400
+    
+    try:
+        # Сохраняем файлы временно
+        proforma_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(proforma_file.filename))
+        invoice_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(invoice_file.filename))
+        
+        proforma_file.save(proforma_path)
+        invoice_file.save(invoice_path)
+        
+        # Обрабатываем файлы
+        result = process_files(proforma_path, invoice_path)
+        
+        # Удаляем временные файлы
+        os.remove(proforma_path)
+        os.remove(invoice_path)
+        
+        return jsonify({'data': result})
+        
+    except Exception as e:
+        # Удаляем временные файлы в случае ошибки
+        if os.path.exists(proforma_path):
+            os.remove(proforma_path)
+        if os.path.exists(invoice_path):
+            os.remove(invoice_path)
+        
+        return jsonify({'error': str(e)}), 500
 
-    df_waybill_clean = pd.DataFrame(waybill_data)
+@app.route('/templates/<path:filename>')
+def serve_static(filename):
+    return render_template(filename)
 
-    # --- объединяем ---
-    df_summary = df_invoice_clean.merge(df_waybill_clean, on="Код ТНВЭД", how="left")
-
-    # --- добавляем итого ---
-    totals = {
-        "№ п/п": "ИТОГО",
-        "Код ТНВЭД": "",
-        "Наименование товара": "",
-        "Кол-во": df_summary["Кол-во"].sum(skipna=True),
-        "Стоимость": df_summary["Стоимость"].sum(skipna=True),
-        "Вес (кг)": df_summary["Вес (кг)"].sum(skipna=True)
-    }
-    df_summary = pd.concat([df_summary, pd.DataFrame([totals])], ignore_index=True)
-
-    return df_summary
-
-@app.route("/", methods=["GET", "POST"])
-def upload():
-    if request.method == "POST":
-        invoice = request.files.get("invoice")
-        waybill = request.files.get("waybill")
-        if not invoice or not waybill:
-            return "Пожалуйста, загрузите оба файла"
-        df_summary = make_summary(invoice, waybill)
-
-        # сохраняем в память как Excel
-        output = BytesIO()
-        df_summary.to_excel(output, index=False)
-        output.seek(0)
-        return send_file(output, as_attachment=True, download_name="summary.xlsx")
-
-    return render_template_string(UPLOAD_FORM)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+if __name__ == '__main__':
+    app.run(debug=True)
